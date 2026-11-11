@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -30,8 +31,6 @@ func InstrumentTracing(rdb redis.UniversalClient, opts ...TracingOption) error {
 		rdb.AddHook(newTracingHook(connString, opts...))
 		return nil
 	case *redis.ClusterClient:
-		rdb.AddHook(newTracingHook("", opts...))
-
 		rdb.OnNewNode(func(rdb *redis.Client) {
 			opt := rdb.Options()
 			opts = addServerAttributes(opts, opt.Addr)
@@ -40,14 +39,17 @@ func InstrumentTracing(rdb redis.UniversalClient, opts ...TracingOption) error {
 		})
 		return nil
 	case *redis.Ring:
-		rdb.AddHook(newTracingHook("", opts...))
-
-		rdb.OnNewNode(func(rdb *redis.Client) {
+		instrument := func(rdb *redis.Client) {
 			opt := rdb.Options()
-			opts = addServerAttributes(opts, opt.Addr)
+			opts := addServerAttributes(slices.Clone(opts), opt.Addr)
 			connString := formatDBConnString(opt.Network, opt.Addr)
 			rdb.AddHook(newTracingHook(connString, opts...))
-		})
+		}
+		// NewRing creates the shards before OnNewNode can be called.
+		for _, shard := range rdb.GetShardClients() {
+			instrument(shard)
+		}
+		rdb.OnNewNode(instrument)
 		return nil
 	default:
 		return fmt.Errorf("redisotel: %T not supported", rdb)
@@ -91,6 +93,11 @@ func newTracingHook(connString string, opts ...TracingOption) *tracingHook {
 
 func (th *tracingHook) DialHook(hook redis.DialHook) redis.DialHook {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+
+		if th.conf.filterDial {
+			return hook(ctx, network, addr)
+		}
+
 		ctx, span := th.conf.tracer.Start(ctx, "redis.dial", th.spanOpts...)
 		defer span.End()
 
@@ -105,14 +112,22 @@ func (th *tracingHook) DialHook(hook redis.DialHook) redis.DialHook {
 
 func (th *tracingHook) ProcessHook(hook redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
-		fn, file, line := funcFileLine("github.com/redis/go-redis")
+
+		// Check if the command should be filtered out
+		if th.conf.filterProcess != nil && th.conf.filterProcess(cmd) {
+			// If so, just call the next hook
+			return hook(ctx, cmd)
+		}
 
 		attrs := make([]attribute.KeyValue, 0, 8)
-		attrs = append(attrs,
-			semconv.CodeFunction(fn),
-			semconv.CodeFilepath(file),
-			semconv.CodeLineNumber(line),
-		)
+		if th.conf.callerEnabled {
+			fn, file, line := funcFileLine("github.com/redis/go-redis")
+			attrs = append(attrs,
+				semconv.CodeFunction(fn),
+				semconv.CodeFilepath(file),
+				semconv.CodeLineNumber(line),
+			)
+		}
 
 		if th.conf.dbStmtEnabled {
 			cmdString := rediscmd.CmdString(cmd)
@@ -137,15 +152,24 @@ func (th *tracingHook) ProcessPipelineHook(
 	hook redis.ProcessPipelineHook,
 ) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
-		fn, file, line := funcFileLine("github.com/redis/go-redis")
+
+		if th.conf.filterProcessPipeline != nil && th.conf.filterProcessPipeline(cmds) {
+			return hook(ctx, cmds)
+		}
 
 		attrs := make([]attribute.KeyValue, 0, 8)
 		attrs = append(attrs,
-			semconv.CodeFunction(fn),
-			semconv.CodeFilepath(file),
-			semconv.CodeLineNumber(line),
 			attribute.Int("db.redis.num_cmd", len(cmds)),
 		)
+
+		if th.conf.callerEnabled {
+			fn, file, line := funcFileLine("github.com/redis/go-redis")
+			attrs = append(attrs,
+				semconv.CodeFunction(fn),
+				semconv.CodeFilepath(file),
+				semconv.CodeLineNumber(line),
+			)
+		}
 
 		summary, cmdsString := rediscmd.CmdsString(cmds)
 		if th.conf.dbStmtEnabled {

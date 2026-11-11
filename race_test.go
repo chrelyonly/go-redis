@@ -105,7 +105,7 @@ var _ = Describe("races", func() {
 	})
 
 	It("should handle big vals in Get", func() {
-		C, N = 4, 100
+		C, N := 4, 100
 
 		bigVal := bigVal()
 
@@ -126,7 +126,7 @@ var _ = Describe("races", func() {
 	})
 
 	It("should handle big vals in Set", func() {
-		C, N = 4, 100
+		C, N := 4, 100
 
 		bigVal := bigVal()
 		perform(C, func(id int) {
@@ -138,7 +138,7 @@ var _ = Describe("races", func() {
 	})
 
 	It("should select db", Label("NonRedisEnterprise"), func() {
-		err := client.Set(ctx, "db", 1, 0).Err()
+		err := client.Set(ctx, "db", 0, 0).Err()
 		Expect(err).NotTo(HaveOccurred())
 
 		perform(C, func(id int) {
@@ -159,7 +159,7 @@ var _ = Describe("races", func() {
 
 		n, err := client.Get(ctx, "db").Int64()
 		Expect(err).NotTo(HaveOccurred())
-		Expect(n).To(Equal(int64(1)))
+		Expect(n).To(Equal(int64(0)))
 	})
 
 	It("should select DB with read timeout", func() {
@@ -180,7 +180,10 @@ var _ = Describe("races", func() {
 		})
 	})
 
-	It("should Watch/Unwatch", func() {
+	// NonRedisEnterprise: 10 goroutines running 1000 contended WATCH/MULTI/EXEC iterations
+	// on a single key is impractically slow against a remote Redis Enterprise endpoint
+	// (optimistic-lock retries x network latency); it needs a low-latency local server.
+	It("should Watch/Unwatch", Label("NonRedisEnterprise"), func() {
 		err := client.Set(ctx, "key", "0", 0).Err()
 		Expect(err).NotTo(HaveOccurred())
 
@@ -214,12 +217,14 @@ var _ = Describe("races", func() {
 		Expect(val).To(Equal(int64(C * N)))
 	})
 
-	PIt("should BLPop", func() {
-		var received uint32
+	It("should BLPop", func() {
+		C := 5
+		N := 5
+		var received atomic.Uint32
 
 		wg := performAsync(C, func(id int) {
 			for {
-				v, err := client.BLPop(ctx, 5*time.Second, "list").Result()
+				v, err := client.BLPop(ctx, time.Second, "list").Result()
 				if err != nil {
 					if err == redis.Nil {
 						break
@@ -227,7 +232,7 @@ var _ = Describe("races", func() {
 					Expect(err).NotTo(HaveOccurred())
 				}
 				Expect(v).To(Equal([]string{"list", "hello"}))
-				atomic.AddUint32(&received, 1)
+				received.Add(1)
 			}
 		})
 
@@ -239,7 +244,7 @@ var _ = Describe("races", func() {
 		})
 
 		wg.Wait()
-		Expect(atomic.LoadUint32(&received)).To(Equal(uint32(C * N)))
+		Expect(received.Load()).To(Equal(uint32(C * N)))
 	})
 })
 

@@ -1,9 +1,13 @@
 package redis
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 type ClusterCmdable interface {
 	ClusterMyShardID(ctx context.Context) *StringCmd
+	ClusterMyID(ctx context.Context) *StringCmd
 	ClusterSlots(ctx context.Context) *ClusterSlotsCmd
 	ClusterShards(ctx context.Context) *ClusterShardsCmd
 	ClusterLinks(ctx context.Context) *ClusterLinksCmd
@@ -35,6 +39,15 @@ func (c cmdable) ClusterMyShardID(ctx context.Context) *StringCmd {
 	return cmd
 }
 
+func (c cmdable) ClusterMyID(ctx context.Context) *StringCmd {
+	cmd := NewStringCmd(ctx, "cluster", "myid")
+	_ = c(ctx, cmd)
+	return cmd
+}
+
+// ClusterSlots returns the mapping of cluster slots to nodes.
+//
+// Deprecated: Use ClusterShards instead as of Redis 7.0.0.
 func (c cmdable) ClusterSlots(ctx context.Context) *ClusterSlotsCmd {
 	cmd := NewClusterSlotsCmd(ctx, "cluster", "slots")
 	_ = c(ctx, cmd)
@@ -131,11 +144,30 @@ func (c cmdable) ClusterDelSlots(ctx context.Context, slots ...int) *StatusCmd {
 	return cmd
 }
 
-func (c cmdable) ClusterDelSlotsRange(ctx context.Context, min, max int) *StatusCmd {
+// slotsRange expands the inclusive range [min, max] into the slot list the
+// CLUSTER ADDSLOTS/DELSLOTS commands take. A range whose length comes out
+// negative or overflows would panic in make(), so it is reported as an error.
+func slotsRange(min, max int) ([]int, error) {
+	if max < min {
+		return nil, fmt.Errorf("redis: invalid slot range %d..%d: max is below min", min, max)
+	}
 	size := max - min + 1
+	if size <= 0 {
+		return nil, fmt.Errorf("redis: invalid slot range %d..%d: range is too large", min, max)
+	}
 	slots := make([]int, size)
-	for i := 0; i < size; i++ {
+	for i := range slots {
 		slots[i] = min + i
+	}
+	return slots, nil
+}
+
+func (c cmdable) ClusterDelSlotsRange(ctx context.Context, min, max int) *StatusCmd {
+	slots, err := slotsRange(min, max)
+	if err != nil {
+		cmd := NewStatusCmd(ctx)
+		cmd.SetErr(err)
+		return cmd
 	}
 	return c.ClusterDelSlots(ctx, slots...)
 }
@@ -146,6 +178,9 @@ func (c cmdable) ClusterSaveConfig(ctx context.Context) *StatusCmd {
 	return cmd
 }
 
+// ClusterSlaves lists the replica nodes of a master node.
+//
+// Deprecated: Use ClusterReplicas instead as of Redis 5.0.0.
 func (c cmdable) ClusterSlaves(ctx context.Context, nodeID string) *StringSliceCmd {
 	cmd := NewStringSliceCmd(ctx, "cluster", "slaves", nodeID)
 	_ = c(ctx, cmd)
@@ -171,10 +206,11 @@ func (c cmdable) ClusterAddSlots(ctx context.Context, slots ...int) *StatusCmd {
 }
 
 func (c cmdable) ClusterAddSlotsRange(ctx context.Context, min, max int) *StatusCmd {
-	size := max - min + 1
-	slots := make([]int, size)
-	for i := 0; i < size; i++ {
-		slots[i] = min + i
+	slots, err := slotsRange(min, max)
+	if err != nil {
+		cmd := NewStatusCmd(ctx)
+		cmd.SetErr(err)
+		return cmd
 	}
 	return c.ClusterAddSlots(ctx, slots...)
 }

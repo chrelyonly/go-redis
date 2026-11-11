@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"math"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -71,4 +73,63 @@ func TestGetAddr(t *testing.T) {
 
 		Expect(GetAddr("127")).To(Equal(""))
 	})
+}
+
+func BenchmarkReplaceSpaces(b *testing.B) {
+	version := runtime.Version()
+	for i := 0; i < b.N; i++ {
+		_ = ReplaceSpaces(version)
+	}
+}
+
+func ReplaceSpacesUseBuilder(s string) string {
+	// Pre-allocate a builder with the same length as s to minimize allocations.
+	// This is a basic optimization; adjust the initial size based on your use case.
+	var builder strings.Builder
+	builder.Grow(len(s))
+
+	for _, char := range s {
+		if char == ' ' {
+			// Replace space with a hyphen.
+			builder.WriteRune('-')
+		} else {
+			// Copy the character as-is.
+			builder.WriteRune(char)
+		}
+	}
+
+	return builder.String()
+}
+
+func BenchmarkReplaceSpacesUseBuilder(b *testing.B) {
+	version := runtime.Version()
+	for i := 0; i < b.N; i++ {
+		_ = ReplaceSpacesUseBuilder(version)
+	}
+}
+
+func TestFormatFloat(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    float64
+		expected string
+	}{
+		{"NaN", math.NaN(), NaN},
+		{"positive infinity", math.Inf(1), Inf},
+		{"negative infinity", math.Inf(-1), NInf},
+		{"zero", 0, "0"},
+		{"positive integer", 42, "42"},
+		{"negative integer", -42, "-42"},
+		{"positive float", 3.14159, "3.14159"},
+		{"negative float", -3.14159, "-3.14159"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := FormatFloat(tt.input)
+			if result != tt.expected {
+				t.Errorf("FormatFloat(%v) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
 }

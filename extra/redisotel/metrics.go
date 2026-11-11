@@ -2,8 +2,10 @@ package redisotel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -13,9 +15,15 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+type metricsState struct {
+	registrations []metric.Registration
+	closed        bool
+	mutex         sync.Mutex
+}
+
 // InstrumentMetrics starts reporting OpenTelemetry Metrics.
 //
-// Based on https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/metrics/semantic_conventions/database-metrics.md
+// Based on https://github.com/open-telemetry/semantic-conventions/blob/main/docs/database/database-metrics.md
 func InstrumentMetrics(rdb redis.UniversalClient, opts ...MetricsOption) error {
 	baseOpts := make([]baseOption, len(opts))
 	for i, opt := range opts {
@@ -29,50 +37,68 @@ func InstrumentMetrics(rdb redis.UniversalClient, opts ...MetricsOption) error {
 			metric.WithInstrumentationVersion("semver:"+redis.Version()),
 		)
 	}
+	if conf.poolName == "" {
+		switch rdb := rdb.(type) {
+		case *redis.Client:
+			conf.poolName = rdb.Options().Addr
+		case *redis.ClusterClient:
+			for _, addr := range rdb.Options().Addrs {
+				conf.poolName = addr
+				break
+			}
+		case *redis.Ring:
+			for _, addr := range rdb.Options().Addrs {
+				conf.poolName = addr
+				break
+			}
+		default:
+			return fmt.Errorf("redisotel: %T not supported", rdb)
+		}
+	}
+	conf.attrs = append(conf.attrs, attribute.String("pool.name", conf.poolName))
+
+	var state *metricsState
+	if conf.closeChan != nil {
+		state = &metricsState{
+			registrations: make([]metric.Registration, 0),
+			closed:        false,
+			mutex:         sync.Mutex{},
+		}
+
+		go func() {
+			<-conf.closeChan
+
+			state.mutex.Lock()
+			state.closed = true
+
+			for _, registration := range state.registrations {
+				if err := registration.Unregister(); err != nil {
+					otel.Handle(err)
+				}
+			}
+			state.mutex.Unlock()
+		}()
+	}
 
 	switch rdb := rdb.(type) {
 	case *redis.Client:
-		if conf.poolName == "" {
-			opt := rdb.Options()
-			conf.poolName = opt.Addr
-		}
-		conf.attrs = append(conf.attrs, attribute.String("pool.name", conf.poolName))
-
-		if err := reportPoolStats(rdb, conf); err != nil {
-			return err
-		}
-		if err := addMetricsHook(rdb, conf); err != nil {
-			return err
-		}
-		return nil
+		return registerClient(rdb, conf, state)
 	case *redis.ClusterClient:
 		rdb.OnNewNode(func(rdb *redis.Client) {
-			if conf.poolName == "" {
-				opt := rdb.Options()
-				conf.poolName = opt.Addr
-			}
-			conf.attrs = append(conf.attrs, attribute.String("pool.name", conf.poolName))
-
-			if err := reportPoolStats(rdb, conf); err != nil {
-				otel.Handle(err)
-			}
-			if err := addMetricsHook(rdb, conf); err != nil {
+			if err := registerClient(rdb, conf, state); err != nil {
 				otel.Handle(err)
 			}
 		})
 		return nil
 	case *redis.Ring:
+		// NewRing creates the shards before OnNewNode can be called.
+		for _, shard := range rdb.GetShardClients() {
+			if err := registerClient(shard, conf, state); err != nil {
+				return err
+			}
+		}
 		rdb.OnNewNode(func(rdb *redis.Client) {
-			if conf.poolName == "" {
-				opt := rdb.Options()
-				conf.poolName = opt.Addr
-			}
-			conf.attrs = append(conf.attrs, attribute.String("pool.name", conf.poolName))
-
-			if err := reportPoolStats(rdb, conf); err != nil {
-				otel.Handle(err)
-			}
-			if err := addMetricsHook(rdb, conf); err != nil {
+			if err := registerClient(rdb, conf, state); err != nil {
 				otel.Handle(err)
 			}
 		})
@@ -82,17 +108,77 @@ func InstrumentMetrics(rdb redis.UniversalClient, opts ...MetricsOption) error {
 	}
 }
 
-func reportPoolStats(rdb *redis.Client, conf *config) error {
-	labels := conf.attrs
-	idleAttrs := append(labels, attribute.String("state", "idle"))
-	usedAttrs := append(labels, attribute.String("state", "used"))
+func registerClient(rdb *redis.Client, conf *config, state *metricsState) error {
+	if state != nil {
+		state.mutex.Lock()
+		defer state.mutex.Unlock()
+
+		if state.closed {
+			return nil
+		}
+	}
+
+	registration, err := reportPoolStats(rdb, conf)
+	if err != nil {
+		return err
+	}
+
+	if state != nil {
+		state.registrations = append(state.registrations, registration)
+	}
+
+	if err := addMetricsHook(rdb, conf); err != nil {
+		return err
+	}
+	return nil
+}
+
+func poolStatsAttrs(conf *config) (poolAttrs, idleAttrs, usedAttrs attribute.Set) {
+	// attribute.NewSet sorts and de-duplicates its input slice in place.
+	// conf.attrs is shared with every metricsHook.attrs, which is read
+	// concurrently while MinIdleConns pre-warms connections in the background,
+	// so pass a copy to avoid mutating the shared backing array (issue #3880).
+	attrs := make([]attribute.KeyValue, len(conf.attrs))
+	copy(attrs, conf.attrs)
+	poolAttrs = attribute.NewSet(attrs...)
+	idleAttrs = attribute.NewSet(append(poolAttrs.ToSlice(), attribute.String("state", "idle"))...)
+	usedAttrs = attribute.NewSet(append(poolAttrs.ToSlice(), attribute.String("state", "used"))...)
+	return
+}
+
+// cumulativePoolStat creates an observable instrument for a monotonically
+// increasing pool statistic. By default it uses Int64ObservableUpDownCounter to
+// preserve backwards compatibility with existing exporters; when
+// conf.semconvCompliantMetrics is set it uses Int64ObservableCounter as the
+// OpenTelemetry database semantic conventions require. Both instrument types
+// satisfy metric.Int64Observable, so callers observe them uniformly. See #3612.
+func cumulativePoolStat(conf *config, name, description string) (metric.Int64Observable, error) {
+	if conf.semconvCompliantMetrics {
+		return conf.meter.Int64ObservableCounter(
+			name,
+			metric.WithDescription(description),
+		)
+	}
+	return conf.meter.Int64ObservableUpDownCounter(
+		name,
+		metric.WithDescription(description),
+	)
+}
+
+type poolStatsClient interface {
+	Options() *redis.Options
+	PoolStats() *redis.PoolStats
+}
+
+func reportPoolStats(rdb poolStatsClient, conf *config) (metric.Registration, error) {
+	poolAttrs, idleAttrs, usedAttrs := poolStatsAttrs(conf)
 
 	idleMax, err := conf.meter.Int64ObservableUpDownCounter(
 		"db.client.connections.idle.max",
 		metric.WithDescription("The maximum number of idle open connections allowed"),
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	idleMin, err := conf.meter.Int64ObservableUpDownCounter(
@@ -100,7 +186,7 @@ func reportPoolStats(rdb *redis.Client, conf *config) error {
 		metric.WithDescription("The minimum number of idle open connections allowed"),
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	connsMax, err := conf.meter.Int64ObservableUpDownCounter(
@@ -108,7 +194,7 @@ func reportPoolStats(rdb *redis.Client, conf *config) error {
 		metric.WithDescription("The maximum number of open connections allowed"),
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	usage, err := conf.meter.Int64ObservableUpDownCounter(
@@ -116,40 +202,87 @@ func reportPoolStats(rdb *redis.Client, conf *config) error {
 		metric.WithDescription("The number of connections that are currently in state described by the state attribute"),
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	timeouts, err := conf.meter.Int64ObservableUpDownCounter(
-		"db.client.connections.timeouts",
-		metric.WithDescription("The number of connection timeouts that have occurred trying to obtain a connection from the pool"),
+	waits, err := cumulativePoolStat(conf,
+		"db.client.connections.waits",
+		"The number of times a connection was waited for",
 	)
 	if err != nil {
-		return err
+		return nil, err
+	}
+
+	waitsDuration, err := conf.meter.Int64ObservableUpDownCounter(
+		"db.client.connections.waits_duration",
+		metric.WithDescription("The total time spent for waiting a connection in nanoseconds"),
+		metric.WithUnit("ns"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	timeouts, err := cumulativePoolStat(conf,
+		"db.client.connections.timeouts",
+		"The number of connection timeouts that have occurred trying to obtain a connection from the pool",
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	hits, err := cumulativePoolStat(conf,
+		"db.client.connections.hits",
+		"The number of times free connection was found in the pool",
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	misses, err := cumulativePoolStat(conf,
+		"db.client.connections.misses",
+		"The number of times free connection was not found in the pool",
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	redisConf := rdb.Options()
-	_, err = conf.meter.RegisterCallback(
+	return conf.meter.RegisterCallback(
 		func(ctx context.Context, o metric.Observer) error {
 			stats := rdb.PoolStats()
 
-			o.ObserveInt64(idleMax, int64(redisConf.MaxIdleConns), metric.WithAttributes(labels...))
-			o.ObserveInt64(idleMin, int64(redisConf.MinIdleConns), metric.WithAttributes(labels...))
-			o.ObserveInt64(connsMax, int64(redisConf.PoolSize), metric.WithAttributes(labels...))
+			o.ObserveInt64(idleMax, int64(redisConf.MaxIdleConns), metric.WithAttributeSet(poolAttrs))
+			o.ObserveInt64(idleMin, int64(redisConf.MinIdleConns), metric.WithAttributeSet(poolAttrs))
+			o.ObserveInt64(connsMax, int64(redisConf.PoolSize), metric.WithAttributeSet(poolAttrs))
 
-			o.ObserveInt64(usage, int64(stats.IdleConns), metric.WithAttributes(idleAttrs...))
-			o.ObserveInt64(usage, int64(stats.TotalConns-stats.IdleConns), metric.WithAttributes(usedAttrs...))
+			o.ObserveInt64(waits, int64(stats.WaitCount), metric.WithAttributeSet(poolAttrs))
+			o.ObserveInt64(waitsDuration, stats.WaitDurationNs, metric.WithAttributeSet(poolAttrs))
 
-			o.ObserveInt64(timeouts, int64(stats.Timeouts), metric.WithAttributes(labels...))
+			o.ObserveInt64(timeouts, int64(stats.Timeouts), metric.WithAttributeSet(poolAttrs))
+			o.ObserveInt64(hits, int64(stats.Hits), metric.WithAttributeSet(poolAttrs))
+			o.ObserveInt64(misses, int64(stats.Misses), metric.WithAttributeSet(poolAttrs))
+
+			// Omit both usage states if the snapshot is inconsistent, without
+			// discarding unrelated observations or publishing a wrapped count.
+			if stats.IdleConns > stats.TotalConns {
+				otel.Handle(fmt.Errorf("redisotel: invalid pool stats: idle connections (%d) exceed total connections (%d)",
+					stats.IdleConns, stats.TotalConns))
+				return nil
+			}
+			o.ObserveInt64(usage, int64(stats.IdleConns), metric.WithAttributeSet(idleAttrs))
+			o.ObserveInt64(usage, int64(stats.TotalConns)-int64(stats.IdleConns), metric.WithAttributeSet(usedAttrs))
 			return nil
 		},
 		idleMax,
 		idleMin,
 		connsMax,
 		usage,
+		waits,
+		waitsDuration,
 		timeouts,
+		hits,
+		misses,
 	)
-
-	return err
 }
 
 func addMetricsHook(rdb *redis.Client, conf *config) error {
@@ -195,11 +328,12 @@ func (mh *metricsHook) DialHook(hook redis.DialHook) redis.DialHook {
 
 		dur := time.Since(start)
 
-		attrs := make([]attribute.KeyValue, 0, len(mh.attrs)+1)
+		attrs := make([]attribute.KeyValue, 0, len(mh.attrs)+2)
 		attrs = append(attrs, mh.attrs...)
 		attrs = append(attrs, statusAttr(err))
+		attrs = append(attrs, errorTypeAttribute(err))
 
-		mh.createTime.Record(ctx, milliseconds(dur), metric.WithAttributes(attrs...))
+		mh.createTime.Record(ctx, milliseconds(dur), metric.WithAttributeSet(attribute.NewSet(attrs...)))
 		return conn, err
 	}
 }
@@ -212,12 +346,13 @@ func (mh *metricsHook) ProcessHook(hook redis.ProcessHook) redis.ProcessHook {
 
 		dur := time.Since(start)
 
-		attrs := make([]attribute.KeyValue, 0, len(mh.attrs)+2)
+		attrs := make([]attribute.KeyValue, 0, len(mh.attrs)+3)
 		attrs = append(attrs, mh.attrs...)
 		attrs = append(attrs, attribute.String("type", "command"))
 		attrs = append(attrs, statusAttr(err))
+		attrs = append(attrs, errorTypeAttribute(err))
 
-		mh.useTime.Record(ctx, milliseconds(dur), metric.WithAttributes(attrs...))
+		mh.useTime.Record(ctx, milliseconds(dur), metric.WithAttributeSet(attribute.NewSet(attrs...)))
 
 		return err
 	}
@@ -233,12 +368,13 @@ func (mh *metricsHook) ProcessPipelineHook(
 
 		dur := time.Since(start)
 
-		attrs := make([]attribute.KeyValue, 0, len(mh.attrs)+2)
+		attrs := make([]attribute.KeyValue, 0, len(mh.attrs)+3)
 		attrs = append(attrs, mh.attrs...)
 		attrs = append(attrs, attribute.String("type", "pipeline"))
 		attrs = append(attrs, statusAttr(err))
+		attrs = append(attrs, errorTypeAttribute(err))
 
-		mh.useTime.Record(ctx, milliseconds(dur), metric.WithAttributes(attrs...))
+		mh.useTime.Record(ctx, milliseconds(dur), metric.WithAttributeSet(attribute.NewSet(attrs...)))
 
 		return err
 	}
@@ -250,7 +386,23 @@ func milliseconds(d time.Duration) float64 {
 
 func statusAttr(err error) attribute.KeyValue {
 	if err != nil {
+		if err == redis.Nil {
+			return attribute.String("status", "nil")
+		}
 		return attribute.String("status", "error")
 	}
 	return attribute.String("status", "ok")
+}
+
+func errorTypeAttribute(err error) attribute.KeyValue {
+	switch {
+	case err == nil:
+		return attribute.String("error_type", "none")
+	case errors.Is(err, context.Canceled):
+		return attribute.String("error_type", "context_canceled")
+	case errors.Is(err, context.DeadlineExceeded):
+		return attribute.String("error_type", "context_timeout")
+	default:
+		return attribute.String("error_type", "other")
+	}
 }
